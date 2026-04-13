@@ -45,3 +45,16 @@ flowchart LR
 
 3. Start the Streamlit UI (terminal 2):
    `uv run streamlit run ui/streamlit_app.py`
+
+4. Start the Privacy Vault (terminal 3):
+   `uv run flask --app vault.app run --host 127.0.0.1 --port 5001`
+
+   The vault exposes two endpoints:
+   - `POST /anonymize` — replaces names, emails, and phone numbers with 8-char hex tokens
+   - `POST /deanonymize` — looks up tokens and restores the original PII values
+
+   By default the vault uses spaCy's English model (`en_core_web_sm`) for name detection. For Spanish or other languages, install the matching model and point to it via `SPACY_MODEL`:
+   ```bash
+   python -m spacy download es_core_news_sm
+   SPACY_MODEL=es_core_news_sm uv run flask --app vault.app run --host 127.0.0.1 --port 5001
+   ```
