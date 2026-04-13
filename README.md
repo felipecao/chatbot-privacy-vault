@@ -38,20 +38,41 @@ flowchart LR
 
 ## Local env setup
 
-1. Copy [`.env.example`](.env.example) to `.env` and set `OPENAI_API_KEY`.
+1. Copy [`.env.example`](.env.example) to `.env` and fill in the required values:
 
-2. Start the Flask API (terminal 1):
+   | Variable | Required | Description |
+   |---|---|---|
+   | `OPENAI_API_KEY` | Yes | OpenAI API key for the chat backend |
+   | `OPENAI_MODEL` | No | Model override (default: `gpt-4o-mini`) |
+   | `CHAT_API_URL` | No | Streamlit → Flask URL (default: `http://127.0.0.1:5000/chat`) |
+   | `MONGO_USERNAME` | No | MongoDB root username (default: `admin`) |
+   | `MONGO_PASSWORD` | No | MongoDB root password (default: `secret`) |
+   | `MONGO_URI` | No | Full connection string (default: `mongodb://admin:secret@localhost:27017/`) |
+   | `MONGO_DB` | No | Database name (default: `privacy_vault`) |
+
+2. Start MongoDB and the Mongo Express UI (terminal 1):
+   ```bash
+   docker compose up -d
+   ```
+   Mongo Express is available at **http://localhost:8081** — no login required in the default config.
+
+   To stop the containers (data is preserved in the `mongo_data` volume):
+   ```bash
+   docker compose down
+   ```
+
+3. Start the Flask API (terminal 2):
    `uv run flask --app backend.app run --host 127.0.0.1 --port 5000`
 
-3. Start the Streamlit UI (terminal 2):
+4. Start the Streamlit UI (terminal 3):
    `uv run streamlit run ui/streamlit_app.py`
 
-4. Start the Privacy Vault (terminal 3):
+5. Start the Privacy Vault (terminal 4):
    `uv run flask --app vault.app run --host 127.0.0.1 --port 5001`
 
    The vault exposes two endpoints:
-   - `POST /anonymize` — replaces names, emails, and phone numbers with 8-char hex tokens
-   - `POST /deanonymize` — looks up tokens and restores the original PII values
+   - `POST /anonymize` — replaces names, emails, and phone numbers with typed tokens (`NAME_*`, `EMAIL_*`, `PHONE_*`) stored in MongoDB
+   - `POST /deanonymize` — looks up tokens in MongoDB and restores the original PII values
 
    By default the vault uses spaCy's English model (`en_core_web_sm`) for name detection. For Spanish or other languages, install the matching model and point to it via `SPACY_MODEL`:
    ```bash

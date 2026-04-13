@@ -10,8 +10,8 @@ POST /anonymize
     Response: {"anonymizedMessage": "<text with PII replaced by tokens>"}
 
 POST /deanonymize
-    Body:     {"message": "<text containing tokens>"}
-    Response: {"originalMessage": "<text with original PII restored>"}
+    Body:     {"anonymizedMessage": "<text containing tokens>"}
+    Response: {"message": "<text with original PII restored>"}
 
 GET /health
     Response: {"ok": true}
@@ -24,22 +24,37 @@ PII detected
                      heuristic as a complementary pass for non-English text
 
 Each word of a multi-word name is replaced by its own independent token.
-The same PII value always maps to the same token within a server session.
+The same PII value always maps to the same token (idempotent, backed by MongoDB).
+
+MongoDB collection: vault_entries
+----------------------------------
+{
+  "token": "NAME_5a1fe53e9b67",   # unique index — deanonymize lookup key
+  "pii":   "Dago",                # unique index — idempotency key
+  "type":  "NAME",                # NAME | EMAIL | PHONE
+  "created_at": ISODate
+}
 
 Environment variables
 ---------------------
 SPACY_MODEL   spaCy model to load (default: en_core_web_sm).
               For Spanish text use: es_core_news_sm
               Install with: python -m spacy download <model>
+MONGO_URI     MongoDB connection string (default: mongodb://admin:secret@localhost:27017/).
+MONGO_DB      Database name (default: privacy_vault).
 """
 
 import logging
 import os
 import re
 import uuid
+from datetime import datetime, timezone
 
 import spacy
 from flask import Flask, jsonify, request
+from pymongo import MongoClient, ASCENDING
+from pymongo.errors import DuplicateKeyError
+from pymongo.collection import ReturnDocument
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,24 +62,47 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# In-memory vault
-# In production this should be a secure, encrypted, persistent store.
+# MongoDB — vault_entries collection
 # ---------------------------------------------------------------------------
 
-_token_to_pii: dict[str, str] = {}  # token → original PII value
-_pii_to_token: dict[str, str] = {}  # original PII value → token
+_MONGO_URI = os.getenv("MONGO_URI", "mongodb://admin:secret@localhost:27017/")
+_MONGO_DB  = os.getenv("MONGO_DB",  "privacy_vault")
+
+_mongo  = MongoClient(_MONGO_URI)
+_db     = _mongo[_MONGO_DB]
+_vault  = _db["vault_entries"]
+
+# Ensure uniqueness on both lookup paths.
+_vault.create_index([("token", ASCENDING)], unique=True, background=True)
+_vault.create_index([("pii",   ASCENDING)], unique=True, background=True)
+
+logger.info("Connected to MongoDB: db=%s collection=vault_entries", _MONGO_DB)
 
 # Matches any vault token in a piece of text, used during deanonymization.
 _TOKEN_RE = re.compile(r"\b(NAME|EMAIL|PHONE)_[0-9a-f]{12}\b")
 
 
 def _get_or_create_token(value: str, prefix: str) -> str:
-    """Return the existing token for *value*, or mint and store a new one."""
-    if value not in _pii_to_token:
-        token = f"{prefix}_{uuid.uuid4().hex[:12]}"
-        _pii_to_token[value] = token
-        _token_to_pii[token] = value
-    return _pii_to_token[value]
+    """
+    Return the existing token for *value*, or atomically mint and store a new one.
+
+    Uses find_one_and_update with upsert=True and $setOnInsert so that:
+    - First call for a given PII value → inserts a new doc, returns new token.
+    - Subsequent calls for the same value → returns existing token unchanged.
+    """
+    new_token = f"{prefix}_{uuid.uuid4().hex[:12]}"
+    doc = _vault.find_one_and_update(
+        filter={"pii": value},
+        update={"$setOnInsert": {
+            "token":      new_token,
+            "pii":        value,
+            "type":       prefix,
+            "created_at": datetime.now(timezone.utc),
+        }},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return doc["token"]
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +173,7 @@ def _overlaps(start: int, end: int, spans: Spans) -> bool:
 def _add_word_spans(text: str, entity_text: str, entity_start: int, spans: Spans) -> None:
     """
     Split a detected name into individual words and append one span per word.
-    The spec requires each word to receive its own independent token.
+    Each word receives its own independent token.
     """
     cursor = entity_start
     for word in entity_text.split():
@@ -199,11 +237,21 @@ def _anonymize(message: str) -> str:
 
 
 def _deanonymize(message: str) -> str:
-    """Replace every vault token in *message* with its original PII value."""
-    return _TOKEN_RE.sub(
-        lambda m: _token_to_pii.get(m.group(), m.group()),
-        message,
-    )
+    """
+    Replace every vault token in *message* with its original PII value.
+
+    Collects all tokens in one pass, fetches them from MongoDB in a single
+    query, then substitutes in a second pass — one round-trip regardless of
+    how many tokens are present.
+    """
+    token_set = {m.group() for m in _TOKEN_RE.finditer(message)}
+    if not token_set:
+        return message
+
+    docs = _vault.find({"token": {"$in": list(token_set)}}, {"token": 1, "pii": 1})
+    lookup = {doc["token"]: doc["pii"] for doc in docs}
+
+    return _TOKEN_RE.sub(lambda m: lookup.get(m.group(), m.group()), message)
 
 
 # ---------------------------------------------------------------------------
