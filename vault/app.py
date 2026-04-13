@@ -54,11 +54,14 @@ app = Flask(__name__)
 _token_to_pii: dict[str, str] = {}  # token → original PII value
 _pii_to_token: dict[str, str] = {}  # original PII value → token
 
+# Matches any vault token in a piece of text, used during deanonymization.
+_TOKEN_RE = re.compile(r"\b(NAME|EMAIL|PHONE)_[0-9a-f]{12}\b")
 
-def _get_or_create_token(value: str) -> str:
+
+def _get_or_create_token(value: str, prefix: str) -> str:
     """Return the existing token for *value*, or mint and store a new one."""
     if value not in _pii_to_token:
-        token = uuid.uuid4().hex[:8]
+        token = f"{prefix}_{uuid.uuid4().hex[:12]}"
         _pii_to_token[value] = token
         _token_to_pii[token] = value
     return _pii_to_token[value]
@@ -142,7 +145,7 @@ def _add_word_spans(text: str, entity_text: str, entity_start: int, spans: Spans
             continue  # safety: skip if position tracking drifts
         word_end = word_start + len(word)
         if not _overlaps(word_start, word_end, spans):
-            spans.append((word_start, word_end, _get_or_create_token(word)))
+            spans.append((word_start, word_end, _get_or_create_token(word, "NAME")))
         cursor = word_end
 
 
@@ -164,12 +167,12 @@ def _anonymize(message: str) -> str:
     # Pass 1 — Emails (before phones to prevent digits in email addresses
     #           from being matched by the phone pattern)
     for m in _EMAIL_RE.finditer(message):
-        spans.append((m.start(), m.end(), _get_or_create_token(m.group())))
+        spans.append((m.start(), m.end(), _get_or_create_token(m.group(), "EMAIL")))
 
     # Pass 2 — Phone numbers
     for m in _PHONE_RE.finditer(message):
         if not _overlaps(m.start(), m.end(), spans):
-            spans.append((m.start(), m.end(), _get_or_create_token(m.group())))
+            spans.append((m.start(), m.end(), _get_or_create_token(m.group(), "PHONE")))
 
     # Pass 3 — Person names via spaCy NER
     # Only accept PERSON entities where every alphabetic word is Title-Case.
@@ -196,11 +199,11 @@ def _anonymize(message: str) -> str:
 
 
 def _deanonymize(message: str) -> str:
-    """Replace every known token in *message* with its original PII value."""
-    result = message
-    for token, original in _token_to_pii.items():
-        result = result.replace(token, original)
-    return result
+    """Replace every vault token in *message* with its original PII value."""
+    return _TOKEN_RE.sub(
+        lambda m: _token_to_pii.get(m.group(), m.group()),
+        message,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -226,9 +229,9 @@ def anonymize():
 @app.post("/deanonymize")
 def deanonymize():
     body = request.get_json(silent=True)
-    if not body or "message" not in body:
-        return jsonify({"error": "'message' field is required"}), 400
-    if not isinstance(body["message"], str):
-        return jsonify({"error": "'message' must be a string"}), 400
+    if not body or "anonymizedMessage" not in body:
+        return jsonify({"error": "'anonymizedMessage' field is required"}), 400
+    if not isinstance(body["anonymizedMessage"], str):
+        return jsonify({"error": "'anonymizedMessage' must be a string"}), 400
 
-    return jsonify({"originalMessage": _deanonymize(body["message"])})
+    return jsonify({"message": _deanonymize(body["anonymizedMessage"])})
